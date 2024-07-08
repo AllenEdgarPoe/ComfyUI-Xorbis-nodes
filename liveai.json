@@ -1,0 +1,22 @@
+[
+    {
+        "name": "arabian-oil-painting",
+        "prompt": "Ancient Arabian costume, beautiful girl, side soft light, Dark environment, black over black, highly detailed,  masterful painting in the style of Anders Zorn and  Aleksi Briclot, oil on canvas",
+        "negative_prompt": "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, nudity,simplified,abstract,unrealistic,impressionistic,low resolution,bad proportions,text,watermark,low-quality,signature,moiré pattern,downsampling,aliasing,distorted,blurry,glossy,blur,jpeg artifacts,compression artifacts,poorly drawn,low-resolution,bad,distortion,twisted,excessive,exaggerated pose,exaggerated limbs,grainy,symmetrical,duplicate,error,pattern,beginner,pixelated,fake,hyper,glitch,overexposed,high-contrast,bad-contrast,"
+    },
+  {
+        "name": "dreadlocks",
+        "prompt": "a picture of a man with dreadlocks and a jacket on holding a gun in his hand and looking at something, art by flonixsdviewv3",
+        "negative_prompt": "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, nudity,simplified,abstract,unrealistic,impressionistic,low resolution,bad proportions,text,watermark,low-quality,signature,moiré pattern,downsampling,aliasing,distorted,blurry,glossy,blur,jpeg artifacts,compression artifacts,poorly drawn,low-resolution,bad,distortion,twisted,excessive,exaggerated pose,exaggerated limbs,grainy,symmetrical,duplicate,error,pattern,beginner,pixelated,fake,hyper,glitch,overexposed,high-contrast,bad-contrast,"
+    },
+  {
+        "name": "vangogh",
+        "prompt": "artwork in Van Gogh style",
+        "negative_prompt": "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, nudity,simplified,abstract,unrealistic,impressionistic,low resolution,bad proportions,text,watermark,low-quality,signature,moiré pattern,downsampling,aliasing,distorted,blurry,glossy,blur,jpeg artifacts,compression artifacts,poorly drawn,low-resolution,bad,distortion,twisted,excessive,exaggerated pose,exaggerated limbs,grainy,symmetrical,duplicate,error,pattern,beginner,pixelated,fake,hyper,glitch,overexposed,high-contrast,bad-contrast,"
+    },
+  {
+        "name": "renaissance",
+        "prompt": "{\n        \"name\": \"vangogh\",\n        \"prompt\": \"artwork in Van Gogh style\",\n        \"negative_prompt\": \"anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, nudity,simplified,abstract,unrealistic,impressionistic,low resolution,bad proportions,text,watermark,low-quality,signature,moiré pattern,downsampling,aliasing,distorted,blurry,glossy,blur,jpeg artifacts,compression artifacts,poorly drawn,low-resolution,bad,distortion,twisted,excessive,exaggerated pose,exaggerated limbs,grainy,symmetrical,duplicate,error,pattern,beginner,pixelated,fake,hyper,glitch,overexposed,high-contrast,bad-contrast,\"\n    },",
+        "negative_prompt": "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, nudity,simplified,abstract,unrealistic,impressionistic,low resolution,bad proportions,text,watermark,low-quality,signature,moiré pattern,downsampling,aliasing,distorted,blurry,glossy,blur,jpeg artifacts,compression artifacts,poorly drawn,low-resolution,bad,distortion,twisted,excessive,exaggerated pose,exaggerated limbs,grainy,symmetrical,duplicate,error,pattern,beginner,pixelated,fake,hyper,glitch,overexposed,high-contrast,bad-contrast,"
+    }
+]

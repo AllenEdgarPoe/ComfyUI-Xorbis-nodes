@@ -5,11 +5,13 @@ import json
 from PIL import Image, ExifTags
 import numpy as np
 from deep_translator import GoogleTranslator
+import torch
+from comfy import model_management
 
 import folder_paths
 import comfy.sd
 from nodes import MAX_RESOLUTION
-
+from .arch import *
 
 def get_timestamp(time_format):
     now = datetime.now()
@@ -58,6 +60,35 @@ class HumanStyler:
     def run(self):
         style = random.choice(self.styles)
         return (style,)
+
+class ConvertMonochrome():
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("IMAGE",)
+    CATEGORY = "XorbisUtils"
+    FUNCTION = "black_or_white_fast"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required" : {
+                "image": ("IMAGE", ),
+                "threshold" : ("INT", {"default": 200, "min": 0, "max": 255}),
+            }
+        }
+
+    def black_or_white_fast(self, image, threshold):
+        """
+        threshold : higher -> flexible
+        """
+        # Convert image to numpy array
+        data = np.array(image)
+
+        is_nearly_black = (data < threshold).all(axis=-1)
+        data[is_nearly_black] = [0, 0, 0]
+        data[~is_nearly_black] = [255, 255, 255]
+
+        # Convert array back to PIL Image
+        return (torch.Tensor(data),)
 
 
 class SaveLogInfo:
@@ -130,11 +161,70 @@ class SaveLogInfo:
 
         return {}
 
+class RT4KSR_loader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "model_name": (folder_paths.get_filename_list("upscale_models"), ),
+                              "scale": ("INT", {"default":3}),
+                              "safe_load": ("BOOLEAN", {"default": True, "label_on": "true", "label_off": "false"}),
+                             }}
+    RETURN_TYPES = ("UPSCALE_MODEL",)
+    FUNCTION = "load_model"
+
+    CATEGORY = "loaders"
+
+    def load_model(self, model_name, scale, safe_load):
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = model_management.get_torch_device()
+
+        model_path = folder_paths.get_full_path("upscale_models", model_name)
+        checkpoint = torch.load(model_path, map_location=device)
+        model = torch.nn.DataParallel(RT4KSR_Rep(upscale=scale)).to(device)
+        model.load_state_dict(checkpoint['state_dict'], strict=True)
+        return (model, )
+
+        # model_path = folder_paths.get_full_path("upscale_models", model_name)
+        # checkpoint = torch.load(model_path)
+        # model = RT4KSR_Rep(upscale=scale)
+        # net = model.load_state_dict(checkpoint['state_dict'], strict=True)
+        # return (net, )
+
+
+
+class Upscale_RT4SR:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "upscale_model": ("UPSCALE_MODEL",),
+                              "image": ("IMAGE",),
+                              }}
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "upscale"
+
+    CATEGORY = "image/upscaling"
+
+    def upscale(self, upscale_model, image):
+        device = model_management.get_torch_device()
+        #
+        # memory_required = model_management.module_size(upscale_model)
+        # memory_required += (512 * 512 * 3) * image.element_size() * max(upscale_model.scale, 1.0) * 384.0 #The 384.0 is an estimate of how much some of these models take, TODO: make it more accurate
+        # memory_required += image.nelement() * image.element_size()
+        # model_management.free_memory(memory_required, device)
+        #
+        # upscale_model.to(device)
+        in_img = image.movedim(-1,-3).to(device)
+
+        output = upscale_model(in_img)
+        # upscale_model.cpu()
+        s = torch.clamp(output.movedim(-3,-1), min=0, max=1.0)
+        return (s,)
 
 
 NODE_CLASS_MAPPINGS = {
     "Save Log Info": SaveLogInfo,
-    "Add Human Styler" : HumanStyler
+    "Add Human Styler" : HumanStyler,
+    "Convert Monochrome" : ConvertMonochrome,
+    "RT4KSR Loader" : RT4KSR_loader,
+    "Upscale RT4SR" : Upscale_RT4SR
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = { "Save log info" : "Save Log Info" }
