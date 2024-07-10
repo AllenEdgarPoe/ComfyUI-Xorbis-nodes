@@ -11,12 +11,22 @@
     },
   {
         "name": "vangogh",
-        "prompt": "artwork in Van Gogh style",
+        "prompt": "artwork in Van Gogh style, vangogh",
         "negative_prompt": "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, nudity,simplified,abstract,unrealistic,impressionistic,low resolution,bad proportions,text,watermark,low-quality,signature,moiré pattern,downsampling,aliasing,distorted,blurry,glossy,blur,jpeg artifacts,compression artifacts,poorly drawn,low-resolution,bad,distortion,twisted,excessive,exaggerated pose,exaggerated limbs,grainy,symmetrical,duplicate,error,pattern,beginner,pixelated,fake,hyper,glitch,overexposed,high-contrast,bad-contrast,"
     },
   {
-        "name": "renaissance",
-        "prompt": "{\n        \"name\": \"vangogh\",\n        \"prompt\": \"artwork in Van Gogh style\",\n        \"negative_prompt\": \"anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, nudity,simplified,abstract,unrealistic,impressionistic,low resolution,bad proportions,text,watermark,low-quality,signature,moiré pattern,downsampling,aliasing,distorted,blurry,glossy,blur,jpeg artifacts,compression artifacts,poorly drawn,low-resolution,bad,distortion,twisted,excessive,exaggerated pose,exaggerated limbs,grainy,symmetrical,duplicate,error,pattern,beginner,pixelated,fake,hyper,glitch,overexposed,high-contrast,bad-contrast,\"\n    },",
+        "name": "blonde-girl",
+        "prompt": "ethereal fantasy concept art of  two side up long blonde hair pink ribbon white dress lace-trimmed embroidery long sleeves blush embarrassed smile blue eyes sitting on side english floral garden . magnificent, celestial, ethereal, painterly, epic, majestic, magical, fantasy art, cover art, dreamy",
+        "negative_prompt": "anime, photorealistic, 35mm film, deformed, glitch, low contrast, noisy"
+    },
+  {
+        "name": "cyborg-broken",
+        "prompt": "Photo of a broken ruined cyborg girl in a landfill, robot, body is broken with scares and holes,half the face is android,laying on the ground, creating a hyperpunk scene with desaturated dark red and blue details, colorful polaroid with vibrant colors, (vacations, high resolution:1.3), (small, selective focus, european film:1.2), art by Otomo Katsuhiro",
+        "negative_prompt": "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, nudity,simplified,abstract,unrealistic,impressionistic,low resolution,bad proportions,text,watermark,low-quality,signature,moiré pattern,downsampling,aliasing,distorted,blurry,glossy,blur,jpeg artifacts,compression artifacts,poorly drawn,low-resolution,bad,distortion,twisted,excessive,exaggerated pose,exaggerated limbs,grainy,symmetrical,duplicate,error,pattern,beginner,pixelated,fake,hyper,glitch,overexposed,high-contrast,bad-contrast,"
+    },
+  {
+        "name": "galaxy-bottle",
+        "prompt": "portrait photograph of a beautiful glass bottle filled with scenery nature landscape and black galaxy",
         "negative_prompt": "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured, nudity,simplified,abstract,unrealistic,impressionistic,low resolution,bad proportions,text,watermark,low-quality,signature,moiré pattern,downsampling,aliasing,distorted,blurry,glossy,blur,jpeg artifacts,compression artifacts,poorly drawn,low-resolution,bad,distortion,twisted,excessive,exaggerated pose,exaggerated limbs,grainy,symmetrical,duplicate,error,pattern,beginner,pixelated,fake,hyper,glitch,overexposed,high-contrast,bad-contrast,"
     }
 ]
