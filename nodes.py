@@ -4,8 +4,6 @@ from datetime import datetime
 import json
 from PIL import Image, ExifTags
 import numpy as np
-from deep_translator import GoogleTranslator
-import torch
 from comfy import model_management
 
 import folder_paths
@@ -181,6 +179,7 @@ class RT4KSR_loader:
         checkpoint = torch.load(model_path, map_location=device)
         model = torch.nn.DataParallel(RT4KSR_Rep(upscale=scale)).to(device)
         model.load_state_dict(checkpoint['state_dict'], strict=True)
+
         return (model, )
 
         # model_path = folder_paths.get_full_path("upscale_models", model_name)
@@ -196,27 +195,33 @@ class Upscale_RT4SR:
     def INPUT_TYPES(s):
         return {"required": { "upscale_model": ("UPSCALE_MODEL",),
                               "image": ("IMAGE",),
+                              "scale": ("INT", {"default":3})
                               }}
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "upscale"
 
     CATEGORY = "image/upscaling"
 
-    def upscale(self, upscale_model, image):
+    @torch.inference_mode()
+    def upscale(self, upscale_model, image, scale):
         device = model_management.get_torch_device()
-        #
-        # memory_required = model_management.module_size(upscale_model)
-        # memory_required += (512 * 512 * 3) * image.element_size() * max(upscale_model.scale, 1.0) * 384.0 #The 384.0 is an estimate of how much some of these models take, TODO: make it more accurate
-        # memory_required += image.nelement() * image.element_size()
-        # model_management.free_memory(memory_required, device)
-        #
-        # upscale_model.to(device)
-        in_img = image.movedim(-1,-3).to(device)
+        model_management.soft_empty_cache()
 
-        output = upscale_model(in_img)
-        # upscale_model.cpu()
-        s = torch.clamp(output.movedim(-3,-1), min=0, max=1.0)
-        return (s,)
+        batch_size, height, width, channel = image.size()
+        upscaled_images = torch.empty([batch_size, height*scale, width*scale, channel], device='cpu')
+
+        for i in range(batch_size):
+            in_img = image[i].unsqueeze(0).movedim(-1, -3).to(device)
+
+            with torch.no_grad():
+                output = upscale_model(in_img)
+            s = torch.clamp(output.movedim(-3,-1), min=0, max=1.0)
+
+            upscaled_images[i:i+1] = s.cpu()
+            model_management.soft_empty_cache()
+
+        model_management.soft_empty_cache()
+        return (upscaled_images,)
 
 import json
 import os
