@@ -1,9 +1,9 @@
-import os
-import random
+import cv2
+import torchvision.transforms.v2 as T
 from datetime import datetime
-import json
-from PIL import Image, ExifTags
+from PIL import Image, ImageOps
 import numpy as np
+import requests
 from comfy import model_management
 
 import folder_paths
@@ -58,6 +58,389 @@ class HumanStyler:
     def run(self):
         style = random.choice(self.styles)
         return (style,)
+
+class OneImageCompare:
+    @classmethod
+    def INPUT_TYPES(s):
+
+        font_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fonts")
+        file_list = [f for f in os.listdir(font_dir) if
+                     os.path.isfile(os.path.join(font_dir, f)) and f.lower().endswith(".ttf")]
+
+        return {"required": {
+            "text1": ("STRING", {"multiline": True, "default": "text"}),
+            "footer_height": ("INT", {"default": 100, "min": 0, "max": 1024}),
+            "font_name": (file_list,),
+            "font_size": ("INT", {"default": 50, "min": 0, "max": 1024}),
+            "mode": (["normal", "dark"],),
+            "border_thickness": ("INT", {"default": 20, "min": 0, "max": 1024}),
+        },
+            "optional": {
+                "image1": ("IMAGE",),
+            }
+
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING",)
+    RETURN_NAMES = ("image", "show_help",)
+    FUNCTION = "layout"
+
+    def layout(self, text1,
+               footer_height, font_name, font_size, mode,
+               border_thickness, image1=None):
+
+        from .utils import tensor2pil, apply_resize_image, text_panel, combine_images, pil2tensor
+
+        # Get RGB values for the text and background colors
+        if mode == "normal":
+            font_color = "black"
+            bg_color = "white"
+        else:
+            font_color = "white"
+            bg_color = "black"
+
+        if image1 is not None:
+
+            img1 = tensor2pil(image1)
+
+            # Get image width and height
+            image_width, image_height = img1.width, img1.height
+
+
+            # Set defaults
+            margins = 50
+            line_spacing = 0
+            position_x = 0
+            position_y = 0
+            align = "center"
+            rotation_angle = 0
+            rotation_options = "image center"
+            font_outline_thickness = 0
+            font_outline_color = "black"
+            align = "center"
+            footer_align = "center"
+            outline_thickness = border_thickness // 2
+            border_thickness = border_thickness // 2
+
+            ### Create text panel for image 1
+            if footer_height > 0:
+                text_panel1 = text_panel(image_width, footer_height, text1,
+                                         font_name, font_size, font_color,
+                                         font_outline_thickness, font_outline_color,
+                                         bg_color,
+                                         margins, line_spacing,
+                                         position_x, position_y,
+                                         align, footer_align,
+                                         rotation_angle, rotation_options)
+
+            combined_img1 = combine_images([img1, text_panel1], 'vertical')
+
+            # Apply the outline
+            if outline_thickness > 0:
+                combined_img1 = ImageOps.expand(combined_img1, outline_thickness, fill=bg_color)
+
+
+            # Apply the outline
+            if outline_thickness > 0:
+                combined_img1 = ImageOps.expand(combined_img1, outline_thickness, fill=bg_color)
+
+            result_img = combine_images([combined_img1], 'horizontal')
+        else:
+            result_img = Image.new('RGB', (512, 512), bg_color)
+
+        # Add a border to the combined image
+        if border_thickness > 0:
+            result_img = ImageOps.expand(result_img, border_thickness, bg_color)
+
+        return (pil2tensor(result_img), )
+
+    # ---------------------------------------------------------------------------------------------------------------------
+
+
+class ThreeImageCompare:
+    @classmethod
+    def INPUT_TYPES(s):
+
+        font_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fonts")
+        file_list = [f for f in os.listdir(font_dir) if
+                     os.path.isfile(os.path.join(font_dir, f)) and f.lower().endswith(".ttf")]
+
+        return {"required": {
+            "text1": ("STRING", {"multiline": True, "default": "text"}),
+            "text2": ("STRING", {"multiline": True, "default": "text"}),
+            "text3": ("STRING", {"multiline": True, "default": "text"}),
+            "footer_height": ("INT", {"default": 100, "min": 0, "max": 1024}),
+            "font_name": (file_list,),
+            "font_size": ("INT", {"default": 50, "min": 0, "max": 1024}),
+            "mode": (["normal", "dark"],),
+            "border_thickness": ("INT", {"default": 20, "min": 0, "max": 1024}),
+        },
+            "optional": {
+                "image1": ("IMAGE",),
+                "image2": ("IMAGE",),
+                "image3": ("IMAGE",),
+            }
+
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING",)
+    RETURN_NAMES = ("image", "show_help",)
+    FUNCTION = "layout"
+
+    def layout(self, text1, text2, text3,
+               footer_height, font_name, font_size, mode,
+               border_thickness, image1=None, image2=None, image3=None):
+
+        from .utils import tensor2pil, apply_resize_image, text_panel, combine_images, pil2tensor
+
+        # Get RGB values for the text and background colors
+        if mode == "normal":
+            font_color = "black"
+            bg_color = "white"
+        else:
+            font_color = "white"
+            bg_color = "black"
+
+        if image1 is not None and image2 is not None and image3 is not None:
+
+            img1 = tensor2pil(image1)
+            img2 = tensor2pil(image2)
+            img3 = tensor2pil(image3)
+
+            # Get image width and height
+            image_width, image_height = img1.width, img1.height
+
+            if img2.width != img1.width or img2.height != img1.height:
+                img2 = apply_resize_image(img2, image_width, image_height, 8, "rescale", "false", 1, 256, "lanczos")
+
+            if img3.width != img1.width or img3.height != img1.height:
+                img3 = apply_resize_image(img3, image_width, image_height, 8, "rescale", "false", 1, 256, "lanczos")
+
+            # Set defaults
+            margins = 50
+            line_spacing = 0
+            position_x = 0
+            position_y = 0
+            align = "center"
+            rotation_angle = 0
+            rotation_options = "image center"
+            font_outline_thickness = 0
+            font_outline_color = "black"
+            align = "center"
+            footer_align = "center"
+            outline_thickness = border_thickness // 2
+            border_thickness = border_thickness // 2
+
+            ### Create text panel for image 1
+            if footer_height > 0:
+                text_panel1 = text_panel(image_width, footer_height, text1,
+                                         font_name, font_size, font_color,
+                                         font_outline_thickness, font_outline_color,
+                                         bg_color,
+                                         margins, line_spacing,
+                                         position_x, position_y,
+                                         align, footer_align,
+                                         rotation_angle, rotation_options)
+
+            combined_img1 = combine_images([img1, text_panel1], 'vertical')
+
+            # Apply the outline
+            if outline_thickness > 0:
+                combined_img1 = ImageOps.expand(combined_img1, outline_thickness, fill=bg_color)
+
+            ### Create text panel for image 2
+            if footer_height > 0:
+                text_panel2 = text_panel(image_width, footer_height, text2,
+                                         font_name, font_size, font_color,
+                                         font_outline_thickness, font_outline_color,
+                                         bg_color,
+                                         margins, line_spacing,
+                                         position_x, position_y,
+                                         align, footer_align,
+                                         rotation_angle, rotation_options)
+
+            combined_img2 = combine_images([img2, text_panel2], 'vertical')
+
+            ### Create text panel for image 3
+            if footer_height > 0:
+                text_panel3 = text_panel(image_width, footer_height, text3,
+                                         font_name, font_size, font_color,
+                                         font_outline_thickness, font_outline_color,
+                                         bg_color,
+                                         margins, line_spacing,
+                                         position_x, position_y,
+                                         align, footer_align,
+                                         rotation_angle, rotation_options)
+
+            combined_img3 = combine_images([img3, text_panel3], 'vertical')
+
+            # Apply the outline
+            if outline_thickness > 0:
+                combined_img1 = ImageOps.expand(combined_img1, outline_thickness, fill=bg_color)
+
+            if outline_thickness > 0:
+                combined_img2 = ImageOps.expand(combined_img2, outline_thickness, fill=bg_color)
+
+            if outline_thickness > 0:
+                combined_img3 = ImageOps.expand(combined_img3, outline_thickness, fill=bg_color)
+
+            result_img = combine_images([combined_img1, combined_img2, combined_img3], 'horizontal')
+        else:
+            result_img = Image.new('RGB', (512, 512), bg_color)
+
+        # Add a border to the combined image
+        if border_thickness > 0:
+            result_img = ImageOps.expand(result_img, border_thickness, bg_color)
+
+        return (pil2tensor(result_img), )
+
+    # ---------------------------------------------------------------------------------------------------------------------
+class MaskAlignedBbox4Inpainting:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "padding": ("INT", { "default": 0, "min": 0, "max": 4096, "step": 1, }),
+                "blur": ("INT", { "default": 0, "min": 0, "max": 256, "step": 1, }),
+                "linedistance" : ("INT", { "default": 0, "min": 0, "max": 100, "step": 0.5, })
+            },
+            "optional": {
+                "image_optional": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("MASK", "MASK", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("MASK", "ORI_MASK", "MASKED_IMAGE", "MASKED_IMAGE_WITH_SKETCH")
+    FUNCTION = "execute"
+    CATEGORY = "essentials/mask"
+
+    def connect_and_fill_contours(self, mask_np, linedistance=5):
+        kernel = np.ones((linedistance, linedistance), np.uint8)
+        dilated_mask = cv2.dilate(mask_np, kernel, iterations=1)
+        contours, _ = cv2.findContours(dilated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        filled_mask_np = np.zeros_like(mask_np)
+        cv2.drawContours(filled_mask_np, contours, -1, (1,), thickness=cv2.FILLED)
+
+        return filled_mask_np
+
+    def fill_mask(self, mask_tensor, linedistance=5):
+        mask_np = mask_tensor.cpu().numpy()
+        filled_mask_np = np.zeros_like(mask_np)
+
+        for i in range(mask_np.shape[0]):
+            mask_2d = mask_np[i]
+            if mask_2d.ndim > 2:
+                raise ValueError('Mask dimension is not 2D')
+            connected_filled_mask_2d = self.connect_and_fill_contours(mask_2d.astype(np.uint8), linedistance)
+
+            filled_mask_np[i] = connected_filled_mask_2d
+
+        filled_mask_tensor = torch.from_numpy(filled_mask_np).to(mask_tensor.device, dtype=torch.float32)
+        return filled_mask_tensor
+
+    def execute(self, mask, padding, blur, linedistance,  image_optional=None):
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+
+        if image_optional is None:
+            image_optional = mask.unsqueeze(3).repeat(1, 1, 1, 3)
+
+        # resize the image if it's not the same size as the mask
+        if image_optional.shape[1:] != mask.shape[1:]:
+            image_optional = comfy.utils.common_upscale(image_optional.permute([0,3,1,2]), mask.shape[2], mask.shape[1], upscale_method='bicubic', crop='center').permute([0,2,3,1])
+
+        # match batch size
+        if image_optional.shape[0] < mask.shape[0]:
+            image_optional = torch.cat((image_optional, image_optional[-1].unsqueeze(0).repeat(mask.shape[0]-image_optional.shape[0], 1, 1, 1)), dim=0)
+        elif image_optional.shape[0] > mask.shape[0]:
+            image_optional = image_optional[:mask.shape[0]]
+
+        # blur the mask
+        if blur > 0:
+            if blur % 2 == 0:
+                blur += 1
+            mask = T.functional.gaussian_blur(mask.unsqueeze(1), blur).squeeze(1)
+
+        filled_mask = self.fill_mask(mask, linedistance=linedistance)
+
+
+        if padding > 0:
+            kernel = torch.ones((1, 1, padding, padding), device=filled_mask.device, dtype=filled_mask.dtype)
+            filled_mask = torch.nn.functional.conv2d(filled_mask.unsqueeze(1), kernel, padding=padding).squeeze(1)
+            filled_mask = torch.clamp(filled_mask, 0, 1)
+
+        image_optional_masked = image_optional.clone()
+        for i in range(image_optional.shape[-1]):
+            image_optional_masked[0,...,i] *= (1-filled_mask.squeeze(0))
+
+        new_mask = (filled_mask != mask).int().unsqueeze(-1)
+        result = image_optional * (1 - new_mask)
+
+        return (mask, filled_mask.unsqueeze(0), image_optional_masked, result)
+
+
+
+class MaskSquareBbox4Inpainting:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "padding": ("INT", { "default": 0, "min": 0, "max": 4096, "step": 1, }),
+                "blur": ("INT", { "default": 0, "min": 0, "max": 256, "step": 1, }),
+            },
+            "optional": {
+                "image_optional": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("MASK", "MASK", "IMAGE", "INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("MASK", "ORI_MASK", "IMAGE", "x", "y", "width", "height")
+    FUNCTION = "execute"
+    CATEGORY = "essentials/mask"
+
+    def execute(self, mask, padding, blur, image_optional=None):
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+
+        if image_optional is None:
+            image_optional = mask.unsqueeze(3).repeat(1, 1, 1, 3)
+
+        # resize the image if it's not the same size as the mask
+        if image_optional.shape[1:] != mask.shape[1:]:
+            image_optional = comfy.utils.common_upscale(image_optional.permute([0,3,1,2]), mask.shape[2], mask.shape[1], upscale_method='bicubic', crop='center').permute([0,2,3,1])
+
+        # match batch size
+        if image_optional.shape[0] < mask.shape[0]:
+            image_optional = torch.cat((image_optional, image_optional[-1].unsqueeze(0).repeat(mask.shape[0]-image_optional.shape[0], 1, 1, 1)), dim=0)
+        elif image_optional.shape[0] > mask.shape[0]:
+            image_optional = image_optional[:mask.shape[0]]
+
+        # blur the mask
+        if blur > 0:
+            if blur % 2 == 0:
+                blur += 1
+            mask = T.functional.gaussian_blur(mask.unsqueeze(1), blur).squeeze(1)
+
+        _, y, x = torch.where(mask)
+        x1 = max(0, x.min().item() - padding)
+        x2 = min(mask.shape[2], x.max().item() + 1 + padding)
+        y1 = max(0, y.min().item() - padding)
+        y2 = min(mask.shape[1], y.max().item() + 1 + padding)
+
+        # crop the mask
+        mask = mask[:, y1:y2, x1:x2]
+        ori_mask = torch.ones(image_optional.shape[1:3])
+        ori_mask[y1:y2, x1:x2] = 0
+        ori_mask = 1 - ori_mask
+
+        image_optional_masked = image_optional.clone()
+        for i in range(image_optional.shape[-1]):
+            image_optional_masked[0,...,i] *= (1-ori_mask)
+        return (mask, ori_mask.unsqueeze(0), image_optional_masked, x1, y1, x2 - x1, y2 - y1)
+
 
 class ConvertMonochrome():
     RETURN_TYPES = ("IMAGE",)
@@ -222,6 +605,7 @@ class Upscale_RT4SR:
 
         model_management.soft_empty_cache()
         return (upscaled_images,)
+
 
 import json
 import os
@@ -529,6 +913,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 }
 
 NODE_CLASS_MAPPINGS = {
+    "Mask Square bbox for Inpainting" : MaskSquareBbox4Inpainting,
+    "Mask Aligned bbox for Inpainting": MaskAlignedBbox4Inpainting,
+    "One Image Compare": OneImageCompare,
+    "Three Image Compare" : ThreeImageCompare,
     "Save Log Info": SaveLogInfo,
     "Add Human Styler" : HumanStyler,
     "Convert Monochrome" : ConvertMonochrome,

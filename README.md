@@ -6,3 +6,4 @@ This repository is for MuseumX Update. We use ComfyUI as our framework, and the 
 ### Node list
 1. HumanStyler
 2. SaveLogInfo
+3. 
