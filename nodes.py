@@ -10,6 +10,8 @@ import folder_paths
 import comfy.sd
 from nodes import MAX_RESOLUTION
 from .arch import *
+from concave_hull import concave_hull_indexes
+from scipy.ndimage import binary_fill_holes
 
 def get_timestamp(time_format):
     now = datetime.now()
@@ -295,6 +297,53 @@ class ThreeImageCompare:
         return (pil2tensor(result_img), )
 
     # ---------------------------------------------------------------------------------------------------------------------
+class MaskAlignedBbox4ConcaveHull:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image" : ("IMAGE",),
+                "ori_masked_sketch" : ("MASK",),
+                "masked_sketch": ("MASK",),
+            },
+        }
+    RETURN_TYPES = ("MASK", "IMAGE", "IMAGE")
+    # MASK is for VAE Encode mask input
+    # MASKED_IMAGE is for VAE Encode image input
+    # MASKED_IMAGE_WITH_SKETCH is for ControlNet input
+    RETURN_NAMES = ("MASK", "MASKED_IMAGE", "MASKED_IMAGE_WITH_SKETCH")
+    FUNCTION = "execute"
+
+    def fill_mask(self, mask_tensor):
+        mask_np = mask_tensor.cpu().numpy()
+        filled_mask_np = np.zeros_like(mask_np)
+
+        for i in range(mask_np.shape[0]):
+            mask_2d = mask_np[i]  # Extract 2D mask for single batch item
+            if mask_2d.ndim > 2:  # If more than 2 dimensions, it's not a grayscale image
+                raise ValueError("Mask dimension is greater than 2D which is not expected for single-batch item.")
+
+            # Find contours in the mask
+            contours, _ = cv2.findContours(mask_2d.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Draw filled contours on the empty mask
+            cv2.drawContours(filled_mask_np[i], contours, -1, (1,), thickness=cv2.FILLED)
+        filled_mask_tensor = torch.from_numpy(filled_mask_np).to(mask_tensor.device, dtype=torch.float32)
+        return filled_mask_tensor
+
+
+    def execute(self, image, ori_masked_sketch, masked_sketch):
+        # Fill in masked_sketch to make mask
+        mask = self.fill_mask(masked_sketch)
+
+        image_masked = image.clone()
+        for i in range(image_masked.shape[-1]):
+            image_masked[0,...,i] *= (1-mask.squeeze(0))
+
+        new_mask = (ori_masked_sketch != mask).int().unsqueeze(-1)
+        result = image * (1 - new_mask)
+
+        return (mask, image_masked, result)
+
 class MaskAlignedBbox4Inpainting:
     @classmethod
     def INPUT_TYPES(s):
@@ -327,6 +376,7 @@ class MaskAlignedBbox4Inpainting:
 
     def fill_mask(self, mask_tensor, linedistance=5):
         mask_np = mask_tensor.cpu().numpy()
+
         filled_mask_np = np.zeros_like(mask_np)
 
         for i in range(mask_np.shape[0]):
@@ -341,6 +391,7 @@ class MaskAlignedBbox4Inpainting:
         return filled_mask_tensor
 
     def execute(self, mask, padding, blur, linedistance,  image_optional=None):
+        mask = (mask != 0.)
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
@@ -380,6 +431,92 @@ class MaskAlignedBbox4Inpainting:
 
         return (mask, filled_mask.unsqueeze(0), image_optional_masked, result)
 
+class MaskAlignedBbox4Inpainting2:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "padding": ("INT", { "default": 0, "min": 0, "max": 4096, "step": 1, }),
+                "blur": ("INT", { "default": 0, "min": 0, "max": 256, "step": 1, }),
+                "linedistance" : ("INT", { "default": 0, "min": 0, "max": 100, "step": 0.5, })
+            },
+            "optional": {
+                "image_optional": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("MASK", "MASK", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("MASK", "ORI_MASK", "MASKED_IMAGE", "MASKED_IMAGE_WITH_SKETCH")
+    FUNCTION = "execute"
+    CATEGORY = "essentials/mask"
+
+    def connect_and_fill_contours(self, mask_np, linedistance=5):
+        kernel = np.ones((linedistance, linedistance), np.uint8)
+        dilated_mask = cv2.dilate(mask_np, kernel, iterations=1)
+        contours, _ = cv2.findContours(dilated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        filled_mask_np = np.zeros_like(mask_np)
+        cv2.drawContours(filled_mask_np, contours, -1, (1,), thickness=cv2.FILLED)
+
+        return filled_mask_np
+
+    def fill_mask(self, mask_tensor, linedistance=5):
+        mask_np = mask_tensor.cpu().numpy()
+
+        filled_mask_np = np.zeros_like(mask_np)
+
+        for i in range(mask_np.shape[0]):
+            mask_2d = mask_np[i]
+            if mask_2d.ndim > 2:
+                raise ValueError('Mask dimension is not 2D')
+            connected_filled_mask_2d = self.connect_and_fill_contours(mask_2d.astype(np.uint8), linedistance)
+
+            filled_mask_np[i] = connected_filled_mask_2d
+
+        filled_mask_tensor = torch.from_numpy(filled_mask_np).to(mask_tensor.device, dtype=torch.float32)
+        return filled_mask_tensor
+
+    def execute(self, mask, padding, blur, linedistance,  image_optional=None):
+        mask = (mask != 0.)
+        mask = mask.float()
+
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+
+        if image_optional is None:
+            image_optional = mask.unsqueeze(3).repeat(1, 1, 1, 3)
+
+        # resize the image if it's not the same size as the mask
+        if image_optional.shape[1:] != mask.shape[1:]:
+            image_optional = comfy.utils.common_upscale(image_optional.permute([0,3,1,2]), mask.shape[2], mask.shape[1], upscale_method='bicubic', crop='center').permute([0,2,3,1])
+
+        # match batch size
+        if image_optional.shape[0] < mask.shape[0]:
+            image_optional = torch.cat((image_optional, image_optional[-1].unsqueeze(0).repeat(mask.shape[0]-image_optional.shape[0], 1, 1, 1)), dim=0)
+        elif image_optional.shape[0] > mask.shape[0]:
+            image_optional = image_optional[:mask.shape[0]]
+
+        # blur the mask
+        if blur > 0:
+            if blur % 2 == 0:
+                blur += 1
+            mask = T.functional.gaussian_blur(mask.unsqueeze(1), blur).squeeze(1)
+
+        filled_mask = mask
+        if padding > 0:
+            kernel = torch.ones((1, 1, padding, padding), device=filled_mask.device, dtype=filled_mask.dtype)
+            filled_mask = torch.nn.functional.conv2d(filled_mask.unsqueeze(1), kernel, padding=padding).squeeze(1)
+            filled_mask = torch.clamp(filled_mask, 0, 1)
+
+        image_optional_masked = image_optional.clone()
+        for i in range(image_optional.shape[-1]):
+            image_optional_masked[0,...,i] *= (1-filled_mask.squeeze(0))
+
+        new_mask = (filled_mask != mask).int().unsqueeze(-1)
+        result = image_optional * (1 - new_mask)
+
+        return (mask, filled_mask.unsqueeze(0), image_optional_masked, result)
 
 
 class MaskSquareBbox4Inpainting:
@@ -605,6 +742,37 @@ class Upscale_RT4SR:
 
         model_management.soft_empty_cache()
         return (upscaled_images,)
+
+class ConcaveHullImage:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "mask": ("MASK",),
+                              "length_threshold": ("INT", {"default":10})
+                              }}
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "run"
+
+    @torch.inference_mode()
+    def run(self, mask, length_threshold):
+        processed_image = []
+        for idx in range(mask.size(0)):
+            twodmask = mask[idx]
+            points = np.column_stack(np.where(twodmask == 1))
+            concave_hull_mask = np.zeros_like(twodmask)
+
+            if len(points) >= 3:
+                idxes = concave_hull_indexes(points[:,:2], length_threshold=length_threshold)
+                idxes = np.append(idxes, idxes[0])
+
+                for f,t in zip(idxes[:-1], idxes[1:]):
+                    seg = points[[f,t]]
+                    cv2.line(concave_hull_mask,
+                     (seg[:,1][0], seg[:,0][0]),
+                     (seg[:,1][1], seg[:, 0][1]),
+                     color=1, thickness=1)
+            processed_image.append(concave_hull_mask)
+        processed_image = torch.from_numpy(np.stack(processed_image))
+        return (processed_image,)
 
 
 import json
@@ -915,6 +1083,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 NODE_CLASS_MAPPINGS = {
     "Mask Square bbox for Inpainting" : MaskSquareBbox4Inpainting,
     "Mask Aligned bbox for Inpainting": MaskAlignedBbox4Inpainting,
+    "Mask Aligned bbox for Inpainting2": MaskAlignedBbox4Inpainting2,
+    "Mask Aligned bbox for ConcaveHull" : MaskAlignedBbox4ConcaveHull,
     "One Image Compare": OneImageCompare,
     "Three Image Compare" : ThreeImageCompare,
     "Save Log Info": SaveLogInfo,
@@ -923,6 +1093,7 @@ NODE_CLASS_MAPPINGS = {
     "RT4KSR Loader" : RT4KSR_loader,
     "Upscale RT4SR" : Upscale_RT4SR,
     "RandomPromptStyler": RandomPromptStyler,
+    "ConcaveHullImage": ConcaveHullImage
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
