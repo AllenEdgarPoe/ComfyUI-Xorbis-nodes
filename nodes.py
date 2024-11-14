@@ -1,36 +1,15 @@
 import cv2
 import torchvision.transforms.v2 as T
-from datetime import datetime
-from PIL import Image, ImageOps
-import numpy as np
-import requests
 from comfy import model_management
-
+from .utils import *
 import folder_paths
 import comfy.sd
 from nodes import MAX_RESOLUTION
 from .arch import *
 from concave_hull import concave_hull_indexes
-from scipy.ndimage import binary_fill_holes
+from scipy.ndimage import gaussian_filter, grey_dilation, binary_fill_holes, binary_closing
+import nodes
 
-def get_timestamp(time_format):
-    now = datetime.now()
-    try:
-        timestamp = now.strftime(time_format)
-    except:
-        timestamp = now.strftime("%Y-%m-%d-%H%M%S")
-
-    return timestamp
-
-def parse_name(ckpt_name):
-    path = ckpt_name
-    filename = path.split("/")[-1]
-    filename = filename.split(".")[:-1]
-    filename = ".".join(filename)
-    return filename
-
-def handle_whitespace(string: str):
-    return string.strip().replace("\n", " ").replace("\r", " ").replace("\t", " ")
 
 
 class HumanStyler:
@@ -303,46 +282,39 @@ class MaskAlignedBbox4ConcaveHull:
         return {
             "required": {
                 "image" : ("IMAGE",),
-                "ori_masked_sketch" : ("MASK",),
-                "masked_sketch": ("MASK",),
+                "concavehull_mask" : ("MASK",),
+                "unfilled_mask": ("MASK",),
             },
         }
     RETURN_TYPES = ("MASK", "IMAGE", "IMAGE")
     # MASK is for VAE Encode mask input
     # MASKED_IMAGE is for VAE Encode image input
     # MASKED_IMAGE_WITH_SKETCH is for ControlNet input
-    RETURN_NAMES = ("MASK", "MASKED_IMAGE", "MASKED_IMAGE_WITH_SKETCH")
+    RETURN_NAMES = ("MASK", "MASKED IMAGE", "UNFILLED MASKED IMAGE")
     FUNCTION = "execute"
 
-    def fill_mask(self, mask_tensor):
-        mask_np = mask_tensor.cpu().numpy()
-        filled_mask_np = np.zeros_like(mask_np)
 
-        for i in range(mask_np.shape[0]):
-            mask_2d = mask_np[i]  # Extract 2D mask for single batch item
-            if mask_2d.ndim > 2:  # If more than 2 dimensions, it's not a grayscale image
-                raise ValueError("Mask dimension is greater than 2D which is not expected for single-batch item.")
+    def execute(self, image, concavehull_mask, unfilled_mask):
+        concavehull_mask = (concavehull_mask != 0.)
+        concavehull_mask = concavehull_mask.float()
 
-            # Find contours in the mask
-            contours, _ = cv2.findContours(mask_2d.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            # Draw filled contours on the empty mask
-            cv2.drawContours(filled_mask_np[i], contours, -1, (1,), thickness=cv2.FILLED)
-        filled_mask_tensor = torch.from_numpy(filled_mask_np).to(mask_tensor.device, dtype=torch.float32)
-        return filled_mask_tensor
+        if concavehull_mask.dim() == 2:
+            concavehull_mask = concavehull_mask.unsqueeze(0)
 
+        unfilled_mask = (unfilled_mask != 0.)
+        unfilled_mask = unfilled_mask.float()
 
-    def execute(self, image, ori_masked_sketch, masked_sketch):
-        # Fill in masked_sketch to make mask
-        mask = self.fill_mask(masked_sketch)
+        if unfilled_mask.dim() == 2:
+            unfilled_mask = unfilled_mask.unsqueeze(0)
 
         image_masked = image.clone()
         for i in range(image_masked.shape[-1]):
-            image_masked[0,...,i] *= (1-mask.squeeze(0))
+            image_masked[0,...,i] *= (1-concavehull_mask.squeeze(0))
 
-        new_mask = (ori_masked_sketch != mask).int().unsqueeze(-1)
+        new_mask = (unfilled_mask != concavehull_mask).int().unsqueeze(-1)
         result = image * (1 - new_mask)
 
-        return (mask, image_masked, result)
+        return (concavehull_mask, image_masked, result)
 
 class MaskAlignedBbox4Inpainting:
     @classmethod
@@ -756,17 +728,10 @@ class ConcaveHullImage:
     def run(self, mask, length_threshold):
         processed_image = []
 
-        aggregate_concave_hull_mask = np.zeros_like(mask)
-
         for idx in range(mask.size(0)):
-
-
-
             twodmask = mask[idx]
             points = np.column_stack(np.where(twodmask == 1))
             concave_hull_mask = np.zeros_like(twodmask)
-
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
             if len(points) >= 3:
                 idxes = concave_hull_indexes(points[:,:2], length_threshold=length_threshold)
@@ -783,241 +748,539 @@ class ConcaveHullImage:
         return (processed_image,)
 
 
-import json
-import os
-import random
-
-def read_json_file(file_path):
+class InpaintCrop:
     """
-    Reads a JSON file's content and returns it.
-    Ensures content matches the expected format.
+    ComfyUI-InpaintCropAndStitch
+    https://github.com/lquesada/ComfyUI-InpaintCropAndStitch
+
+    This node crop before sampling and stitch after sampling for fast, efficient inpainting without altering unmasked areas.
+    Context area can be specified via expand pixels and expand factor or via a separate (optional) mask.
+    Works free size, forced size, and ranged size.
     """
-    if not os.access(file_path, os.R_OK):
-        print(f"Warning: No read permissions for file {file_path}")
-        return None
 
-    try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            content = json.load(file)
-            # Check if the content matches the expected format.
-            if not all(['name' in item and 'prompt' in item and 'negative_prompt' in item for item in content]):
-                print(f"Warning: Invalid content in file {file_path}")
-                return None
-            return content
-    except Exception as e:
-        print(f"An error occurred while reading {file_path}: {str(e)}")
-        return None
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "context_expand_pixels": ("INT", {"default": 20, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),
+                "context_expand_factor": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 100.0, "step": 0.01}),
+                "fill_mask_holes": ("BOOLEAN", {"default": True}),
+                "blur_mask_pixels": ("FLOAT", {"default": 16.0, "min": 0.0, "max": 64.0, "step": 0.1}),
+                "invert_mask": ("BOOLEAN", {"default": False}),
+                "blend_pixels": ("FLOAT", {"default": 16.0, "min": 0.0, "max": 32.0, "step": 0.1}),
+                "rescale_algorithm": (["nearest", "bilinear", "bicubic", "bislerp"], {"default": "bicubic"}),
+                "mode": (["ranged size", "forced size", "free size"], {"default": "ranged size"}),
+                "force_width": ("INT", {"default": 1024, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),  # force
+                "force_height": ("INT", {"default": 1024, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),  # force
+                "rescale_factor": ("FLOAT", {"default": 1.00, "min": 0.01, "max": 100.0, "step": 0.01}),  # free
+                "min_width": ("INT", {"default": 512, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),  # ranged
+                "min_height": ("INT", {"default": 512, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),  # ranged
+                "max_width": ("INT", {"default": 768, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),  # ranged
+                "max_height": ("INT", {"default": 768, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),  # ranged
+                "padding": ([8, 16, 32, 64, 128, 256, 512], {"default": 32}),  # free and ranged
+            },
+            "optional": {
+                "optional_context_mask": ("MASK",),
+                "optional_concavehull_mask": ("MASK",),
 
+            }
+        }
 
-def read_sdxl_styles(json_data):
-    """
-    Returns style names from the provided JSON data.
-    """
-    if not isinstance(json_data, list):
-        print("Error: input data must be a list")
-        return []
+    CATEGORY = "inpaint"
 
-    return [item['name'] for item in json_data if isinstance(item, dict) and 'name' in item]
+    RETURN_TYPES = ("STITCH", "IMAGE", "MASK", "MASK")
+    RETURN_NAMES = ("stitch", "cropped_image", "cropped_filled_mask", "cropped_unfilled_mask")
 
+    FUNCTION = "inpaint_crop"
 
-def get_all_json_files(directory):
-    """
-    Returns all JSON files from the specified directory.
-    """
-    return [os.path.join(directory, file) for file in os.listdir(directory) if
-            file.endswith('.json') and os.path.isfile(os.path.join(directory, file))]
+    def grow_and_blur_mask(self, mask, blur_pixels):
+        if blur_pixels > 0.001:
+            sigma = blur_pixels / 4
+            growmask = mask.reshape((-1, mask.shape[-2], mask.shape[-1])).cpu()
+            out = []
+            for m in growmask:
+                mask_np = m.numpy()
+                kernel_size = math.ceil(sigma * 1.5 + 1)
+                kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+                dilated_mask = grey_dilation(mask_np, footprint=kernel)
+                output = dilated_mask.astype(np.float32) * 255
+                output = torch.from_numpy(output)
+                out.append(output)
+            mask = torch.stack(out, dim=0)
+            mask = torch.clamp(mask, 0.0, 1.0)
 
+            mask_np = mask.numpy()
+            filtered_mask = gaussian_filter(mask_np, sigma=sigma)
+            mask = torch.from_numpy(filtered_mask)
+            mask = torch.clamp(mask, 0.0, 1.0)
 
-def load_styles_from_directory(directory):
-    """
-    Loads styles from all JSON files in the directory.
-    Renames duplicate style names by appending a suffix.
-    """
-    json_files = get_all_json_files(directory)
-    combined_data = []
-    seen = set()
+        return mask
 
-    for json_file in json_files:
-        json_data = read_json_file(json_file)
-        if json_data:
-            for item in json_data:
-                original_style = item['name']
-                style = original_style
-                suffix = 1
-                while style in seen:
-                    style = f"{original_style}_{suffix}"
-                    suffix += 1
-                item['name'] = style
-                seen.add(style)
-                combined_data.append(item)
+    def adjust_to_aspect_ratio(self, x_min, x_max, y_min, y_max, width, height, target_width, target_height):
+        x_min_key, x_max_key, y_min_key, y_max_key = x_min, x_max, y_min, y_max
 
-    unique_style_names = [item['name'] for item in combined_data if isinstance(item, dict) and 'name' in item]
+        # Calculate the current width and height
+        current_width = x_max - x_min + 1
+        current_height = y_max - y_min + 1
 
-    return combined_data, unique_style_names
+        # Calculate aspect ratios
+        aspect_ratio = target_width / target_height
+        current_aspect_ratio = current_width / current_height
 
+        if current_aspect_ratio < aspect_ratio:
+            # Adjust width to match target aspect ratio
+            new_width = int(current_height * aspect_ratio)
+            extend_x = (new_width - current_width)
+            x_min = max(x_min - extend_x // 2, 0)
+            x_max = min(x_max + extend_x // 2, width - 1)
+        else:
+            # Adjust height to match target aspect ratio
+            new_height = int(current_width / aspect_ratio)
+            extend_y = (new_height - current_height)
+            y_min = max(y_min - extend_y // 2, 0)
+            y_max = min(y_max + extend_y // 2, height - 1)
 
-def validate_json_data(json_data):
-    """
-    Validates the structure of the JSON data.
-    """
-    if not isinstance(json_data, list):
-        return False
-    for template in json_data:
-        if 'name' not in template or 'prompt' not in template:
-            return False
-    return True
+        return int(x_min), int(x_max), int(y_min), int(y_max)
 
+    def adjust_to_preferred(self, x_min, x_max, y_min, y_max, width, height, preferred_x_start, preferred_x_end,
+                            preferred_y_start, preferred_y_end):
+        # Ensure the area is within preferred bounds as much as possible
+        if preferred_x_start <= x_min and preferred_x_end >= x_max and preferred_y_start <= y_min and preferred_y_end >= y_max:
+            return x_min, x_max, y_min, y_max
 
-def find_template_by_name(json_data, template_name):
-    """
-    Returns a template from the JSON data by name or None if not found.
-    """
-    for template in json_data:
-        if template['name'] == template_name:
-            return template
-    return None
+        # Shift x_min and x_max to fit within preferred bounds if possible
+        if x_max - x_min + 1 <= preferred_x_end - preferred_x_start + 1:
+            if x_min < preferred_x_start:
+                x_shift = preferred_x_start - x_min
+                x_min += x_shift
+                x_max += x_shift
+            elif x_max > preferred_x_end:
+                x_shift = x_max - preferred_x_end
+                x_min -= x_shift
+                x_max -= x_shift
 
+        # Shift y_min and y_max to fit within preferred bounds if possible
+        if y_max - y_min + 1 <= preferred_y_end - preferred_y_start + 1:
+            if y_min < preferred_y_start:
+                y_shift = preferred_y_start - y_min
+                y_min += y_shift
+                y_max += y_shift
+            elif y_max > preferred_y_end:
+                y_shift = y_max - preferred_y_end
+                y_min -= y_shift
+                y_max -= y_shift
 
-def split_template_advanced(template: str) -> tuple:
-    """
-    Splits a template into two parts based on a specific pattern.
-    """
-    if " . " in template:
-        template_prompt_g, template_prompt_l = template.split(" . ", 1)
-        template_prompt_g = template_prompt_g.strip()
-        template_prompt_l = template_prompt_l.strip()
-    else:
-        template_prompt_g = template
-        template_prompt_l = ""
+        return int(x_min), int(x_max), int(y_min), int(y_max)
 
-    return template_prompt_g, template_prompt_l
+    def apply_padding(self, min_val, max_val, max_boundary, padding):
+        # Calculate the midpoint and the original range size
+        original_range_size = max_val - min_val + 1
+        midpoint = (min_val + max_val) // 2
 
+        # Determine the smallest multiple of padding that is >= original_range_size
+        if original_range_size % padding == 0:
+            new_range_size = original_range_size
+        else:
+            new_range_size = (original_range_size // padding + 1) * padding
 
-def replace_prompts_in_template(template, positive_prompt, negative_prompt):
-    """
-    Replace the placeholders in a given template with the provided prompts.
+        # Calculate the new min and max values centered on the midpoint
+        new_min_val = max(midpoint - new_range_size // 2, 0)
+        new_max_val = new_min_val + new_range_size - 1
 
-    Args:
-    - template (dict): The template containing prompt placeholders.
-    - positive_prompt (str): The positive prompt to replace '{prompt}' in the template.
-    - negative_prompt (str): The negative prompt to be combined with any existing negative prompt in the template.
+        # Ensure the new max doesn't exceed the boundary
+        if new_max_val >= max_boundary:
+            new_max_val = max_boundary - 1
+            new_min_val = max(new_max_val - new_range_size + 1, 0)
 
-    Returns:
-    - tuple: A tuple containing the replaced positive and negative prompts.
-    """
-    positive_result = template['prompt'].replace('{prompt}', positive_prompt)
+        # Ensure the range still ends on a multiple of padding
+        # Adjust if the calculated range isn't feasible within the given constraints
+        if (new_max_val - new_min_val + 1) != new_range_size:
+            new_min_val = max(new_max_val - new_range_size + 1, 0)
 
-    json_negative_prompt = template.get('negative_prompt', "")
-    negative_result = f"{json_negative_prompt}, {negative_prompt}" if json_negative_prompt and negative_prompt else json_negative_prompt or negative_prompt
+        return new_min_val, new_max_val
 
-    return positive_result, negative_result
+    def inpaint_crop(self, image, mask, context_expand_pixels, context_expand_factor, fill_mask_holes, blur_mask_pixels,
+                     invert_mask, blend_pixels, mode, rescale_algorithm, force_width, force_height, rescale_factor,
+                     padding, min_width, min_height, max_width, max_height, optional_context_mask=None, optional_concavehull_mask=None):
+        if image.shape[0] > 1:
+            assert mode == "forced size", "Mode must be 'forced size' when input is a batch of images"
+        assert image.shape[0] == mask.shape[0], "Batch size of images and masks must be the same"
+        if optional_context_mask is not None:
+            assert optional_context_mask.shape[0] == image.shape[
+                0], "Batch size of optional_context_masks must be the same as images or None"
 
+        result_stitch = {'x': [], 'y': [], 'original_image': [], 'cropped_mask_blend': [], 'rescale_x': [],
+                         'rescale_y': [], 'start_x': [], 'start_y': [], 'initial_width': [], 'initial_height': []}
+        results_image = []
+        results_filled_mask = []
+        results_unfilled_mask = []
 
-def replace_prompts_in_template_advanced(template, positive_prompt_g, positive_prompt_l, negative_prompt,
-                                         negative_prompt_to, copy_to_l):
-    """
-    Replace the placeholders in a given template with the provided prompts and split them accordingly.
+        batch_size = image.shape[0]
+        for b in range(batch_size):
+            one_image = image[b].unsqueeze(0)
+            one_mask = mask[b].unsqueeze(0)
+            one_optional_context_mask = None
+            one_concavehull_mask = None
+            if optional_context_mask is not None:
+                one_optional_context_mask = optional_context_mask[b].unsqueeze(0)
+            if optional_concavehull_mask is not None:
+                one_concavehull_mask = optional_concavehull_mask[b].unsqueeze(0)
 
-    Args:
-    - template (dict): The template containing prompt placeholders.
-    - positive_prompt_g (str): The main positive prompt to replace '{prompt}' in the template.
-    - positive_prompt_l (str): The auxiliary positive prompt to be combined in a specific manner.
-    - negative_prompt (str): The negative prompt to be combined with any existing negative prompt in the template.
-    - negative_prompt_to (str): The negative prompt destination {Both, G only, L only}.
-    - copy_to_l (bool): Copy the G positive prompt to L.
+            stitch, cropped_image, cropped_unfilled_mask, cropped_filled_mask = self.inpaint_crop_single_image(
+                one_image,
+                one_mask,
+                context_expand_pixels,
+                context_expand_factor,
+                fill_mask_holes,
+                blur_mask_pixels,
+                invert_mask,
+                blend_pixels,
+                mode,
+                rescale_algorithm,
+                force_width,
+                force_height,
+                rescale_factor,
+                padding,
+                min_width,
+                min_height,
+                max_width,
+                max_height,
+                one_optional_context_mask, one_concavehull_mask)
 
-    Returns:
-    - tuple: A tuple containing the replaced main positive, auxiliary positive, combined positive,  main negative, auxiliary negative, and negative prompts.
-    """
-    template_prompt_g, template_prompt_l_template = split_template_advanced(template['prompt'])
+            for key in result_stitch:
+                result_stitch[key].append(stitch[key])
+            cropped_image = cropped_image.squeeze(0)
+            results_image.append(cropped_image)
+            cropped_unfilled_mask = cropped_unfilled_mask.squeeze(0)
+            results_unfilled_mask.append(cropped_unfilled_mask)
+            cropped_filled_mask = cropped_filled_mask.squeeze(0)
+            results_filled_mask.append(cropped_filled_mask)
 
-    text_g_positive = template_prompt_g.replace("{prompt}", positive_prompt_g)
+        result_image = torch.stack(results_image, dim=0)
+        result_filled_mask = torch.stack(results_filled_mask, dim=0)
+        result_unfilled_mask = torch.stack(results_unfilled_mask, dim=0)
 
-    text_l_positive = f"{template_prompt_l_template.replace('{prompt}', positive_prompt_g)}, {positive_prompt_l}" if template_prompt_l_template and positive_prompt_l else template_prompt_l_template.replace(
-        '{prompt}', positive_prompt_g) or positive_prompt_l
+        return result_stitch, result_image, result_filled_mask, result_unfilled_mask
 
-    if copy_to_l and positive_prompt_g and "{prompt}" not in template_prompt_l_template:
-        token_positive_g = list(map(lambda x: x.strip(), text_g_positive.split(",")))
-        token_positive_l = list(map(lambda x: x.strip(), text_l_positive.split(",")))
+    # Parts of this function are from KJNodes: https://github.com/kijai/ComfyUI-KJNodes
 
-        # deduplicate common prompt parts
-        for token_g in token_positive_g:
-            if token_g in token_positive_l:
-                token_positive_l.remove(token_g)
+    def inpaint_crop_single_image(self, image, mask, context_expand_pixels, context_expand_factor, fill_mask_holes,
+                                  blur_mask_pixels, invert_mask, blend_pixels, mode, rescale_algorithm, force_width,
+                                  force_height, rescale_factor, padding, min_width, min_height, max_width, max_height,
+                                  optional_context_mask=None, concavehull_mask=None):
+        # Validate or initialize mask
+        if mask.shape[1] != image.shape[1] or mask.shape[2] != image.shape[2]:
+            non_zero_indices = torch.nonzero(mask[0], as_tuple=True)
+            if not non_zero_indices[0].size(0):
+                mask = torch.zeros_like(image[:, :, :, 0])
+            else:
+                assert False, "mask size must match image size"
 
-        token_positive_g.extend(token_positive_l)
+        # Determine which mask to use for filled holes processing
+        if concavehull_mask is not None:
+            mask_for_filled_holes = concavehull_mask
+        else:
+            mask_for_filled_holes = mask
 
-        text_l_positive = ", ".join(token_positive_g)
+        # Process mask with filled holes or without based on fill_mask_holes
+        if fill_mask_holes:
+            holemask = mask_for_filled_holes.reshape(
+                (-1, mask_for_filled_holes.shape[-2], mask_for_filled_holes.shape[-1])).cpu()
+            out = []
+            for m in holemask:
+                mask_np = m.numpy()
+                binary_mask = mask_np > 0
+                struct = np.ones((5, 5))
+                closed_mask = binary_closing(binary_mask, structure=struct, border_value=1)
+                filled_mask = binary_fill_holes(closed_mask)
+                output = filled_mask.astype(np.float32) * 255
+                output = torch.from_numpy(output)
+                out.append(output)
+            filled_holes_mask = torch.stack(out, dim=0)
+            filled_holes_mask = torch.clamp(filled_holes_mask, 0.0, 1.0)
+        else:
+            filled_holes_mask = mask_for_filled_holes
 
-    text_positive = f"{text_g_positive} . {text_l_positive}" if text_l_positive else text_g_positive
+        # Grow and blur mask if requested
+        if blur_mask_pixels > 0.001:
+            mask = self.grow_and_blur_mask(mask, blur_mask_pixels)
+            filled_holes_mask = self.grow_and_blur_mask(filled_holes_mask, blur_mask_pixels)
 
-    json_negative_prompt = template.get('negative_prompt', "")
-    text_negative = f"{json_negative_prompt}, {negative_prompt}" if json_negative_prompt and negative_prompt else json_negative_prompt or negative_prompt
+        # Invert mask if requested
+        if invert_mask:
+            mask = 1.0 - mask
+            filled_holes_mask = 1.0 - filled_holes_mask
 
-    text_g_negative = ""
-    if negative_prompt_to in ("Both", "G only"):
-        text_g_negative = text_negative
+        # Validate or initialize context mask
+        if optional_context_mask is None:
+            context_mask = mask
+        elif optional_context_mask.shape[1] != image.shape[1] or optional_context_mask.shape[2] != image.shape[2]:
+            non_zero_indices = torch.nonzero(optional_context_mask[0], as_tuple=True)
+            if not non_zero_indices[0].size(0):
+                context_mask = mask
+            else:
+                assert False, "context_mask size must match image size"
+        else:
+            context_mask = optional_context_mask + mask
+            context_mask = torch.clamp(context_mask, 0.0, 1.0)
 
-    text_l_negative = ""
-    if negative_prompt_to in ("Both", "L only"):
-        text_l_negative = text_negative
+        # Ensure mask dimensions match image dimensions except channels
+        initial_batch, initial_height, initial_width, initial_channels = image.shape
+        mask_batch, mask_height, mask_width = mask.shape
+        context_mask_batch, context_mask_height, context_mask_width = context_mask.shape
+        assert initial_height == mask_height and initial_width == mask_width, "Image and mask dimensions must match"
+        assert initial_height == context_mask_height and initial_width == context_mask_width, "Image and context mask dimensions must match"
 
-    return text_g_positive, text_l_positive, text_positive, text_g_negative, text_l_negative, text_negative
+        # Extend image and masks to turn it into a big square in case the context area would go off bounds
+        extend_y = (initial_width + 1) // 2  # Intended, extend height by width (turn into square)
+        extend_x = (initial_height + 1) // 2  # Intended, extend width by height (turn into square)
+        new_height = initial_height + 2 * extend_y
+        new_width = initial_width + 2 * extend_x
 
+        start_y = extend_y
+        start_x = extend_x
 
-def read_sdxl_templates_replace_and_combine(json_data, template_name, positive_prompt, negative_prompt):
-    """
-    Find a specific template by its name, then replace and combine its placeholders with the provided prompts.
+        new_image = torch.zeros((initial_batch, new_height, new_width, initial_channels), dtype=image.dtype)
+        new_image[:, start_y:start_y + initial_height, start_x:start_x + initial_width, :] = image
 
-    Args:
-    - json_data (list): The list of templates.
-    - template_name (str): The name of the desired template.
-    - positive_prompt (str): The positive prompt to replace placeholders.
-    - negative_prompt (str): The negative prompt to be combined.
+        # Mirror image so there's no bleeding of black border when using inpaintmodelconditioning
+        available_top = min(start_y, initial_height)
+        available_bottom = min(new_height - (start_y + initial_height), initial_height)
+        available_left = min(start_x, initial_width)
+        available_right = min(new_width - (start_x + initial_width), initial_width)
+        # Top
+        new_image[:, start_y - available_top:start_y, start_x:start_x + initial_width, :] = torch.flip(
+            image[:, :available_top, :, :], [1])
+        # Bottom
+        new_image[:, start_y + initial_height:start_y + initial_height + available_bottom,
+        start_x:start_x + initial_width, :] = torch.flip(image[:, -available_bottom:, :, :], [1])
+        # Left
+        new_image[:, start_y:start_y + initial_height, start_x - available_left:start_x, :] = torch.flip(
+            new_image[:, start_y:start_y + initial_height, start_x:start_x + available_left, :], [2])
+        # Right
+        new_image[:, start_y:start_y + initial_height,
+        start_x + initial_width:start_x + initial_width + available_right, :] = torch.flip(
+            new_image[:, start_y:start_y + initial_height,
+            start_x + initial_width - available_right:start_x + initial_width, :], [2])
+        # Top-left corner
+        new_image[:, start_y - available_top:start_y, start_x - available_left:start_x, :] = torch.flip(
+            new_image[:, start_y:start_y + available_top, start_x:start_x + available_left, :], [1, 2])
+        # Top-right corner
+        new_image[:, start_y - available_top:start_y, start_x + initial_width:start_x + initial_width + available_right,
+        :] = torch.flip(new_image[:, start_y:start_y + available_top,
+                        start_x + initial_width - available_right:start_x + initial_width, :], [1, 2])
+        # Bottom-left corner
+        new_image[:, start_y + initial_height:start_y + initial_height + available_bottom,
+        start_x - available_left:start_x, :] = torch.flip(
+            new_image[:, start_y + initial_height - available_bottom:start_y + initial_height,
+            start_x:start_x + available_left, :], [1, 2])
+        # Bottom-right corner
+        new_image[:, start_y + initial_height:start_y + initial_height + available_bottom,
+        start_x + initial_width:start_x + initial_width + available_right, :] = torch.flip(
+            new_image[:, start_y + initial_height - available_bottom:start_y + initial_height,
+            start_x + initial_width - available_right:start_x + initial_width, :], [1, 2])
 
-    Returns:
-    - tuple: A tuple containing the replaced and combined positive and negative prompts.
-    """
-    if not validate_json_data(json_data):
-        return positive_prompt, negative_prompt
+        new_mask = torch.ones((mask_batch, new_height, new_width), dtype=mask.dtype)  # assume ones in extended image
+        new_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = mask
+        new_filled_holes_mask = torch.ones((mask_batch, new_height, new_width),
+                                           dtype=filled_holes_mask.dtype)  # assume ones in extended image
+        new_filled_holes_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = filled_holes_mask
 
-    template = find_template_by_name(json_data, template_name)
+        blend_mask = torch.zeros((mask_batch, new_height, new_width),
+                                 dtype=mask.dtype)  # assume zeros in extended image
+        blend_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = mask
 
-    if template:
-        return replace_prompts_in_template(template, positive_prompt, negative_prompt)
-    else:
-        return positive_prompt, negative_prompt
+        new_context_mask = torch.zeros((mask_batch, new_height, new_width), dtype=context_mask.dtype)
+        new_context_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = context_mask
 
+        image = new_image
+        mask = new_mask
+        filled_holes_mask = new_filled_holes_mask
+        context_mask = new_context_mask
 
-def read_sdxl_templates_replace_and_combine_advanced(json_data, template_name, positive_prompt_g, positive_prompt_l,
-                                                     negative_prompt, negative_prompt_to, copy_to_l):
-    """
-    Find a specific template by its name, then replace and combine its placeholders with the provided prompts in an advanced manner.
+        original_image = image
+        original_mask = mask
+        original_filled_holes_mask = filled_holes_mask
+        original_width = image.shape[2]
+        original_height = image.shape[1]
 
-    Args:
-    - json_data (list): The list of templates.
-    - template_name (str): The name of the desired template.
-    - positive_prompt_g (str): The main positive prompt.
-    - positive_prompt_l (str): The auxiliary positive prompt.
-    - negative_prompt (str): The negative prompt to be combined.
-    - negative_prompt_to (str): The negative prompt destination {Both, G only, L only}.
-    - copy_to_l (bool): Copy the G positive prompt to L.
+        # If there are no non-zero indices in the context_mask, adjust context mask to the whole image
+        non_zero_indices = torch.nonzero(context_mask[0], as_tuple=True)
+        if not non_zero_indices[0].size(0):
+            context_mask = torch.ones_like(image[:, :, :, 0])
+            context_mask = torch.zeros((mask_batch, new_height, new_width), dtype=mask.dtype)
+            context_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] += 1.0
+            non_zero_indices = torch.nonzero(context_mask[0], as_tuple=True)
 
-    Returns:
-    - tuple: A tuple containing the replaced and combined main positive, auxiliary positive, combined positive, main negative, auxiliary negative, and negative prompts.
-    """
-    if not validate_json_data(json_data):
-        return positive_prompt_g, positive_prompt_l, f"{positive_prompt_g} . {positive_prompt_l}", negative_prompt, negative_prompt, negative_prompt
+        # Compute context area from context mask
+        y_min = torch.min(non_zero_indices[0]).item()
+        y_max = torch.max(non_zero_indices[0]).item()
+        x_min = torch.min(non_zero_indices[1]).item()
+        x_max = torch.max(non_zero_indices[1]).item()
+        height = context_mask.shape[1]
+        width = context_mask.shape[2]
 
-    template = find_template_by_name(json_data, template_name)
+        # Grow context area if requested
+        y_size = y_max - y_min + 1
+        x_size = x_max - x_min + 1
+        y_grow = round(max(y_size * (context_expand_factor - 1), context_expand_pixels, blend_pixels ** 1.5))
+        x_grow = round(max(x_size * (context_expand_factor - 1), context_expand_pixels, blend_pixels ** 1.5))
+        y_min = max(y_min - y_grow // 2, 0)
+        y_max = min(y_max + y_grow // 2, height - 1)
+        x_min = max(x_min - x_grow // 2, 0)
+        x_max = min(x_max + x_grow // 2, width - 1)
+        y_size = y_max - y_min + 1
+        x_size = x_max - x_min + 1
 
-    if template:
-        return replace_prompts_in_template_advanced(template, positive_prompt_g, positive_prompt_l, negative_prompt,
-                                                    negative_prompt_to, copy_to_l)
-    else:
-        return positive_prompt_g, positive_prompt_l, f"{positive_prompt_g} . {positive_prompt_l}", negative_prompt, negative_prompt, negative_prompt
+        effective_upscale_factor_x = 1.0
+        effective_upscale_factor_y = 1.0
 
+        # Adjust to preferred size
+        if mode == 'forced size':
+            # Sub case of ranged size.
+            min_width = max_width = force_width
+            min_height = max_height = force_height
 
+        if mode == 'ranged size' or mode == 'forced size':
+            assert max_width >= min_width, "max_width must be greater than or equal to min_width"
+            assert max_height >= min_height, "max_height must be greater than or equal to min_height"
+            # Ensure we set an aspect ratio supported by min_width, max_width, min_height, max_height
+            current_width = x_max - x_min + 1
+            current_height = y_max - y_min + 1
+
+            # Calculate aspect ratio of the selected area
+            current_aspect_ratio = current_width / current_height
+
+            # Calculate the aspect ratio bounds
+            min_aspect_ratio = min_width / max_height
+            max_aspect_ratio = max_width / min_height
+
+            # Adjust target width and height based on aspect ratio bounds
+            if current_aspect_ratio < min_aspect_ratio:
+                # Adjust to meet minimum width constraint
+                target_width = min(current_width, min_width)
+                target_height = int(target_width / min_aspect_ratio)
+                x_min, x_max, y_min, y_max = self.adjust_to_aspect_ratio(x_min, x_max, y_min, y_max, width, height,
+                                                                         target_width, target_height)
+                x_min, x_max, y_min, y_max = self.adjust_to_preferred(x_min, x_max, y_min, y_max, width, height,
+                                                                      start_x, start_x + initial_width, start_y,
+                                                                      start_y + initial_height)
+            elif current_aspect_ratio > max_aspect_ratio:
+                # Adjust to meet maximum width constraint
+                target_height = min(current_height, max_height)
+                target_width = int(target_height * max_aspect_ratio)
+                x_min, x_max, y_min, y_max = self.adjust_to_aspect_ratio(x_min, x_max, y_min, y_max, width, height,
+                                                                         target_width, target_height)
+                x_min, x_max, y_min, y_max = self.adjust_to_preferred(x_min, x_max, y_min, y_max, width, height,
+                                                                      start_x, start_x + initial_width, start_y,
+                                                                      start_y + initial_height)
+            else:
+                # Aspect ratio is within bounds, keep the current size
+                target_width = current_width
+                target_height = current_height
+
+            y_size = y_max - y_min + 1
+            x_size = x_max - x_min + 1
+
+            # Adjust to min and max sizes
+            max_rescale_width = max_width / x_size
+            max_rescale_height = max_height / y_size
+            max_rescale_factor = min(max_rescale_width, max_rescale_height)
+            rescale_factor = max_rescale_factor
+            min_rescale_width = min_width / x_size
+            min_rescale_height = min_height / y_size
+            min_rescale_factor = min(min_rescale_width, min_rescale_height)
+            rescale_factor = max(min_rescale_factor, rescale_factor)
+
+        # Upscale image and masks if requested, they will be downsized at stitch phase
+        if rescale_factor < 0.999 or rescale_factor > 1.001:
+            samples = image
+            samples = samples.movedim(-1, 1)
+            width = math.floor(samples.shape[3] * rescale_factor)
+            height = math.floor(samples.shape[2] * rescale_factor)
+            samples = rescale(samples, width, height, rescale_algorithm)
+            effective_upscale_factor_x = float(width) / float(original_width)
+            effective_upscale_factor_y = float(height) / float(original_height)
+            samples = samples.movedim(1, -1)
+            image = samples
+
+            samples = mask
+            samples = samples.unsqueeze(1)
+            samples = rescale(samples, width, height, "nearest")
+            samples = samples.squeeze(1)
+            mask = samples
+
+            samples = filled_holes_mask
+            samples = samples.unsqueeze(1)
+            samples = rescale(samples, width, height, "nearest")
+            samples = samples.squeeze(1)
+            filled_holes_mask = samples
+
+            samples = blend_mask
+            samples = samples.unsqueeze(1)
+            samples = rescale(samples, width, height, "nearest")
+            samples = samples.squeeze(1)
+            blend_mask = samples
+
+            # Do math based on min,size instead of min,max to avoid rounding errors
+            y_size = y_max - y_min + 1
+            x_size = x_max - x_min + 1
+            target_x_size = int(x_size * effective_upscale_factor_x)
+            target_y_size = int(y_size * effective_upscale_factor_y)
+
+            x_min = math.floor(x_min * effective_upscale_factor_x)
+            x_max = x_min + target_x_size
+            y_min = math.floor(y_min * effective_upscale_factor_y)
+            y_max = y_min + target_y_size
+
+        x_size = x_max - x_min + 1
+        y_size = y_max - y_min + 1
+
+        # Ensure width and height are within specified bounds, key for ranged and forced size
+        if mode == 'ranged size' or mode == 'forced size':
+            if x_size < min_width:
+                x_max = min(x_max + (min_width - x_size), width - 1)
+            elif x_size > max_width:
+                x_max = x_min + max_width - 1
+
+            if y_size < min_height:
+                y_max = min(y_max + (min_height - y_size), height - 1)
+            elif y_size > max_height:
+                y_max = y_min + max_height - 1
+
+        # Recalculate x_size and y_size after adjustments
+        x_size = x_max - x_min + 1
+        y_size = y_max - y_min + 1
+
+        # Pad area (if possible, i.e. if pad is smaller than width/height) to avoid the sampler returning smaller results
+        if (mode == 'free size' or mode == 'ranged size') and padding > 1:
+            x_min, x_max = self.apply_padding(x_min, x_max, width, padding)
+            y_min, y_max = self.apply_padding(y_min, y_max, height, padding)
+
+        # Ensure that context area doesn't go outside of the image
+        x_min = max(x_min, 0)
+        x_max = min(x_max, width - 1)
+        y_min = max(y_min, 0)
+        y_max = min(y_max, height - 1)
+
+        # Crop the image and the masks, sized context area
+        cropped_image = image[:, y_min:y_max + 1, x_min:x_max + 1]
+        cropped_mask = mask[:, y_min:y_max + 1, x_min:x_max + 1]
+        cropped_filled_holes_mask = filled_holes_mask[:, y_min:y_max + 1, x_min:x_max + 1]
+        cropped_mask_blend = blend_mask[:, y_min:y_max + 1, x_min:x_max + 1]
+
+        # Grow and blur mask for blend if requested
+        if blend_pixels > 0.001:
+            cropped_mask_blend = self.grow_and_blur_mask(cropped_filled_holes_mask, blend_pixels)
+
+        # Return stitch (to be consumed by the class below), image, and masks
+        stitch = {'x': x_min, 'y': y_min, 'original_image': original_image, 'cropped_mask_blend': cropped_mask_blend,
+                  'rescale_x': effective_upscale_factor_x, 'rescale_y': effective_upscale_factor_y, 'start_x': start_x,
+                  'start_y': start_y, 'initial_width': initial_width, 'initial_height': initial_height}
+
+        return (stitch, cropped_image, cropped_mask, cropped_filled_holes_mask)
 class RandomPromptStyler:
 
     def __init__(self):
@@ -1101,7 +1364,8 @@ NODE_CLASS_MAPPINGS = {
     "RT4KSR Loader" : RT4KSR_loader,
     "Upscale RT4SR" : Upscale_RT4SR,
     "RandomPromptStyler": RandomPromptStyler,
-    "ConcaveHullImage": ConcaveHullImage
+    "ConcaveHullImage": ConcaveHullImage,
+    "Inpaint Crop Xo" : InpaintCrop
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
