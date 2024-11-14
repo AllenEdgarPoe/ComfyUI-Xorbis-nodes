@@ -728,6 +728,9 @@ class ConcaveHullImage:
     def run(self, mask, length_threshold):
         processed_image = []
 
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+
         for idx in range(mask.size(0)):
             twodmask = mask[idx]
             points = np.column_stack(np.where(twodmask == 1))
@@ -906,6 +909,8 @@ class InpaintCrop:
                      padding, min_width, min_height, max_width, max_height, optional_context_mask=None, optional_concavehull_mask=None):
         if image.shape[0] > 1:
             assert mode == "forced size", "Mode must be 'forced size' when input is a batch of images"
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
         assert image.shape[0] == mask.shape[0], "Batch size of images and masks must be the same"
         if optional_context_mask is not None:
             assert optional_context_mask.shape[0] == image.shape[
