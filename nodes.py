@@ -755,10 +755,18 @@ class ConcaveHullImage:
     @torch.inference_mode()
     def run(self, mask, length_threshold):
         processed_image = []
+
+        aggregate_concave_hull_mask = np.zeros_like(mask)
+
         for idx in range(mask.size(0)):
+
+
+
             twodmask = mask[idx]
             points = np.column_stack(np.where(twodmask == 1))
             concave_hull_mask = np.zeros_like(twodmask)
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
             if len(points) >= 3:
                 idxes = concave_hull_indexes(points[:,:2], length_threshold=length_threshold)
