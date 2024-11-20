@@ -9,6 +9,8 @@ from .arch import *
 from concave_hull import concave_hull_indexes
 from scipy.ndimage import gaussian_filter, grey_dilation, binary_fill_holes, binary_closing
 import nodes
+import base64
+from io import BytesIO
 
 
 
@@ -733,7 +735,7 @@ class ConcaveHullImage:
 
         for idx in range(mask.size(0)):
             twodmask = mask[idx]
-            points = np.column_stack(np.where(twodmask == 1))
+            points = np.column_stack(np.where(twodmask != 0))
             concave_hull_mask = np.zeros_like(twodmask)
 
             if len(points) >= 3:
@@ -1286,6 +1288,7 @@ class InpaintCrop:
                   'start_y': start_y, 'initial_width': initial_width, 'initial_height': initial_height}
 
         return (stitch, cropped_image, cropped_mask, cropped_filled_holes_mask)
+
 class RandomPromptStyler:
 
     def __init__(self):
@@ -1350,6 +1353,30 @@ class RandomPromptStyler:
 
         return text_positive_styled, text_negative_styled
 
+class LoadData:
+    def __init__(self):
+        current_directory = os.path.dirname(os.path.realpath(__file__))
+        self.json_data, styles = load_styles_from_directory(current_directory)
+        pass
+
+    @classmethod
+    def INPUT_TYPES(self):
+        return {
+            "required": {
+                "img_path": ("STRING", {"default": ""}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ('img', 'mask',)
+    FUNCTION = 'load_data'
+
+    def load_data(self, img_path):
+        data = torch.load(img_path)
+        img = data['image']
+        mask = data['mask']
+
+        return (img, mask)
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1370,7 +1397,8 @@ NODE_CLASS_MAPPINGS = {
     "Upscale RT4SR" : Upscale_RT4SR,
     "RandomPromptStyler": RandomPromptStyler,
     "ConcaveHullImage": ConcaveHullImage,
-    "Inpaint Crop Xo" : InpaintCrop
+    "Inpaint Crop Xo" : InpaintCrop,
+    "LoadData" : LoadData
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
