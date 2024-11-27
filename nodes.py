@@ -485,10 +485,11 @@ class MaskAlignedBbox4Inpainting2:
 
         image_optional_masked = image_optional.clone()
         for i in range(image_optional.shape[-1]):
-            image_optional_masked[0,...,i] *= (1-filled_mask.squeeze(0))
+                image_optional_masked[0,...,i] *= (1-filled_mask.squeeze(0))
 
-        new_mask = (filled_mask != mask).int().unsqueeze(-1)
-        result = image_optional * (1 - new_mask)
+        new_mask = (image_optional_masked != image_optional).int()
+        # result = image_optional_masked * (1 - new_mask)
+        result = torch.where(new_mask == 0, 0, image_optional)
 
         return (mask, filled_mask.unsqueeze(0), image_optional_masked, result)
 
@@ -753,15 +754,7 @@ class ConcaveHullImage:
         return (processed_image,)
 
 
-class InpaintCrop:
-    """
-    ComfyUI-InpaintCropAndStitch
-    https://github.com/lquesada/ComfyUI-InpaintCropAndStitch
-
-    This node crop before sampling and stitch after sampling for fast, efficient inpainting without altering unmasked areas.
-    Context area can be specified via expand pixels and expand factor or via a separate (optional) mask.
-    Works free size, forced size, and ranged size.
-    """
+class InpaintCropXo:
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -785,18 +778,17 @@ class InpaintCrop:
                 "max_width": ("INT", {"default": 768, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),  # ranged
                 "max_height": ("INT", {"default": 768, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}),  # ranged
                 "padding": ([8, 16, 32, 64, 128, 256, 512], {"default": 32}),  # free and ranged
+                "drawing_mask" : ("MASK",)
             },
             "optional": {
                 "optional_context_mask": ("MASK",),
-                "optional_concavehull_mask": ("MASK",),
-
             }
         }
 
     CATEGORY = "inpaint"
 
     RETURN_TYPES = ("STITCH", "IMAGE", "MASK", "MASK")
-    RETURN_NAMES = ("stitch", "cropped_image", "cropped_filled_mask", "cropped_unfilled_mask")
+    RETURN_NAMES = ("stitch", "cropped_image", "cropped_mask", "cropped_drawing_mask")
 
     FUNCTION = "inpaint_crop"
 
@@ -908,75 +900,59 @@ class InpaintCrop:
 
     def inpaint_crop(self, image, mask, context_expand_pixels, context_expand_factor, fill_mask_holes, blur_mask_pixels,
                      invert_mask, blend_pixels, mode, rescale_algorithm, force_width, force_height, rescale_factor,
-                     padding, min_width, min_height, max_width, max_height, optional_context_mask=None, optional_concavehull_mask=None):
+                     padding, min_width, min_height, max_width, max_height, drawing_mask, optional_context_mask=None):
         if image.shape[0] > 1:
             assert mode == "forced size", "Mode must be 'forced size' when input is a batch of images"
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
         assert image.shape[0] == mask.shape[0], "Batch size of images and masks must be the same"
         if optional_context_mask is not None:
             assert optional_context_mask.shape[0] == image.shape[
                 0], "Batch size of optional_context_masks must be the same as images or None"
 
+
         result_stitch = {'x': [], 'y': [], 'original_image': [], 'cropped_mask_blend': [], 'rescale_x': [],
                          'rescale_y': [], 'start_x': [], 'start_y': [], 'initial_width': [], 'initial_height': []}
         results_image = []
-        results_filled_mask = []
-        results_unfilled_mask = []
+        results_mask = []
+        results_drawing_mask = []
 
         batch_size = image.shape[0]
         for b in range(batch_size):
             one_image = image[b].unsqueeze(0)
             one_mask = mask[b].unsqueeze(0)
             one_optional_context_mask = None
-            one_concavehull_mask = None
             if optional_context_mask is not None:
                 one_optional_context_mask = optional_context_mask[b].unsqueeze(0)
-            if optional_concavehull_mask is not None:
-                one_concavehull_mask = optional_concavehull_mask[b].unsqueeze(0)
 
-            stitch, cropped_image, cropped_unfilled_mask, cropped_filled_mask = self.inpaint_crop_single_image(
-                one_image,
-                one_mask,
-                context_expand_pixels,
-                context_expand_factor,
-                fill_mask_holes,
-                blur_mask_pixels,
-                invert_mask,
-                blend_pixels,
-                mode,
-                rescale_algorithm,
-                force_width,
-                force_height,
-                rescale_factor,
-                padding,
-                min_width,
-                min_height,
-                max_width,
-                max_height,
-                one_optional_context_mask, one_concavehull_mask)
+            stitch, cropped_image, cropped_mask, cropped_drawing_mask = self.inpaint_crop_single_image(one_image, one_mask,
+                                                                                 context_expand_pixels,
+                                                                                 context_expand_factor, fill_mask_holes,
+                                                                                 blur_mask_pixels, invert_mask,
+                                                                                 blend_pixels, mode, rescale_algorithm,
+                                                                                 force_width, force_height,
+                                                                                 rescale_factor, padding, min_width,
+                                                                                 min_height, max_width, max_height, drawing_mask,
+                                                                                 one_optional_context_mask)
 
             for key in result_stitch:
                 result_stitch[key].append(stitch[key])
             cropped_image = cropped_image.squeeze(0)
             results_image.append(cropped_image)
-            cropped_unfilled_mask = cropped_unfilled_mask.squeeze(0)
-            results_unfilled_mask.append(cropped_unfilled_mask)
-            cropped_filled_mask = cropped_filled_mask.squeeze(0)
-            results_filled_mask.append(cropped_filled_mask)
+            cropped_mask = cropped_mask.squeeze(0)
+            results_mask.append(cropped_mask)
+            cropped_drawing_mask = cropped_drawing_mask.squeeze(0)
+            results_drawing_mask.append(cropped_drawing_mask)
 
         result_image = torch.stack(results_image, dim=0)
-        result_filled_mask = torch.stack(results_filled_mask, dim=0)
-        result_unfilled_mask = torch.stack(results_unfilled_mask, dim=0)
+        result_mask = torch.stack(results_mask, dim=0)
+        result_drawing_mask = torch.stack(results_drawing_mask, dim=0)
 
-        return result_stitch, result_image, result_filled_mask, result_unfilled_mask
+        return result_stitch, result_image, result_mask, result_drawing_mask
 
     # Parts of this function are from KJNodes: https://github.com/kijai/ComfyUI-KJNodes
-
     def inpaint_crop_single_image(self, image, mask, context_expand_pixels, context_expand_factor, fill_mask_holes,
                                   blur_mask_pixels, invert_mask, blend_pixels, mode, rescale_algorithm, force_width,
                                   force_height, rescale_factor, padding, min_width, min_height, max_width, max_height,
-                                  optional_context_mask=None, concavehull_mask=None):
+                                  drawing_mask, optional_context_mask=None):
         # Validate or initialize mask
         if mask.shape[1] != image.shape[1] or mask.shape[2] != image.shape[2]:
             non_zero_indices = torch.nonzero(mask[0], as_tuple=True)
@@ -985,16 +961,9 @@ class InpaintCrop:
             else:
                 assert False, "mask size must match image size"
 
-        # Determine which mask to use for filled holes processing
-        if concavehull_mask is not None:
-            mask_for_filled_holes = concavehull_mask
-        else:
-            mask_for_filled_holes = mask
-
-        # Process mask with filled holes or without based on fill_mask_holes
+        # Fill holes if requested
         if fill_mask_holes:
-            holemask = mask_for_filled_holes.reshape(
-                (-1, mask_for_filled_holes.shape[-2], mask_for_filled_holes.shape[-1])).cpu()
+            holemask = mask.reshape((-1, mask.shape[-2], mask.shape[-1])).cpu()
             out = []
             for m in holemask:
                 mask_np = m.numpy()
@@ -1005,20 +974,16 @@ class InpaintCrop:
                 output = filled_mask.astype(np.float32) * 255
                 output = torch.from_numpy(output)
                 out.append(output)
-            filled_holes_mask = torch.stack(out, dim=0)
-            filled_holes_mask = torch.clamp(filled_holes_mask, 0.0, 1.0)
-        else:
-            filled_holes_mask = mask_for_filled_holes
+            mask = torch.stack(out, dim=0)
+            mask = torch.clamp(mask, 0.0, 1.0)
 
         # Grow and blur mask if requested
         if blur_mask_pixels > 0.001:
             mask = self.grow_and_blur_mask(mask, blur_mask_pixels)
-            filled_holes_mask = self.grow_and_blur_mask(filled_holes_mask, blur_mask_pixels)
 
         # Invert mask if requested
         if invert_mask:
             mask = 1.0 - mask
-            filled_holes_mask = 1.0 - filled_holes_mask
 
         # Validate or initialize context mask
         if optional_context_mask is None:
@@ -1051,7 +1016,6 @@ class InpaintCrop:
 
         new_image = torch.zeros((initial_batch, new_height, new_width, initial_channels), dtype=image.dtype)
         new_image[:, start_y:start_y + initial_height, start_x:start_x + initial_width, :] = image
-
         # Mirror image so there's no bleeding of black border when using inpaintmodelconditioning
         available_top = min(start_y, initial_height)
         available_bottom = min(new_height - (start_y + initial_height), initial_height)
@@ -1068,6 +1032,7 @@ class InpaintCrop:
             new_image[:, start_y:start_y + initial_height, start_x:start_x + available_left, :], [2])
         # Right
         new_image[:, start_y:start_y + initial_height,
+
         start_x + initial_width:start_x + initial_width + available_right, :] = torch.flip(
             new_image[:, start_y:start_y + initial_height,
             start_x + initial_width - available_right:start_x + initial_width, :], [2])
@@ -1089,11 +1054,11 @@ class InpaintCrop:
             new_image[:, start_y + initial_height - available_bottom:start_y + initial_height,
             start_x + initial_width - available_right:start_x + initial_width, :], [1, 2])
 
-        new_mask = torch.ones((mask_batch, new_height, new_width), dtype=mask.dtype)  # assume ones in extended image
+        new_mask = torch.zeros((mask_batch, new_height, new_width), dtype=mask.dtype)
         new_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = mask
-        new_filled_holes_mask = torch.ones((mask_batch, new_height, new_width),
-                                           dtype=filled_holes_mask.dtype)  # assume ones in extended image
-        new_filled_holes_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = filled_holes_mask
+
+        new_drawing_mask = torch.ones((mask_batch, new_height, new_width), dtype=mask.dtype)
+        new_drawing_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = drawing_mask
 
         blend_mask = torch.zeros((mask_batch, new_height, new_width),
                                  dtype=mask.dtype)  # assume zeros in extended image
@@ -1104,12 +1069,11 @@ class InpaintCrop:
 
         image = new_image
         mask = new_mask
-        filled_holes_mask = new_filled_holes_mask
+        drawing_mask = new_drawing_mask
         context_mask = new_context_mask
 
         original_image = image
         original_mask = mask
-        original_filled_holes_mask = filled_holes_mask
         original_width = image.shape[2]
         original_height = image.shape[1]
 
@@ -1219,11 +1183,11 @@ class InpaintCrop:
             samples = samples.squeeze(1)
             mask = samples
 
-            samples = filled_holes_mask
+            samples = drawing_mask
             samples = samples.unsqueeze(1)
             samples = rescale(samples, width, height, "nearest")
             samples = samples.squeeze(1)
-            filled_holes_mask = samples
+            drawing_mask = samples
 
             samples = blend_mask
             samples = samples.unsqueeze(1)
@@ -1272,22 +1236,23 @@ class InpaintCrop:
         y_min = max(y_min, 0)
         y_max = min(y_max, height - 1)
 
-        # Crop the image and the masks, sized context area
+        # Crop the image and the mask, sized context area
         cropped_image = image[:, y_min:y_max + 1, x_min:x_max + 1]
         cropped_mask = mask[:, y_min:y_max + 1, x_min:x_max + 1]
-        cropped_filled_holes_mask = filled_holes_mask[:, y_min:y_max + 1, x_min:x_max + 1]
+        cropped_drawing_mask = drawing_mask[:, y_min:y_max + 1, x_min:x_max + 1]
         cropped_mask_blend = blend_mask[:, y_min:y_max + 1, x_min:x_max + 1]
 
         # Grow and blur mask for blend if requested
         if blend_pixels > 0.001:
-            cropped_mask_blend = self.grow_and_blur_mask(cropped_filled_holes_mask, blend_pixels)
+            cropped_mask_blend = self.grow_and_blur_mask(cropped_mask_blend, blend_pixels)
 
-        # Return stitch (to be consumed by the class below), image, and masks
+        # Return stitch (to be consumed by the class below), image, and mask
         stitch = {'x': x_min, 'y': y_min, 'original_image': original_image, 'cropped_mask_blend': cropped_mask_blend,
                   'rescale_x': effective_upscale_factor_x, 'rescale_y': effective_upscale_factor_y, 'start_x': start_x,
                   'start_y': start_y, 'initial_width': initial_width, 'initial_height': initial_height}
 
-        return (stitch, cropped_image, cropped_mask, cropped_filled_holes_mask)
+        return (stitch, cropped_image, cropped_mask, cropped_drawing_mask)
+
 
 class RandomPromptStyler:
 
@@ -1397,7 +1362,7 @@ NODE_CLASS_MAPPINGS = {
     "Upscale RT4SR" : Upscale_RT4SR,
     "RandomPromptStyler": RandomPromptStyler,
     "ConcaveHullImage": ConcaveHullImage,
-    "Inpaint Crop Xo" : InpaintCrop,
+    "Inpaint Crop Xo" : InpaintCropXo,
     "LoadData" : LoadData
 }
 
